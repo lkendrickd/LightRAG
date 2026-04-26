@@ -241,9 +241,21 @@ class BaseVectorStorage(StorageNameSpace, ABC):
         Return suffix if model_name exists in embedding_func, otherwise return None.
         Note: embedding_func is guaranteed to exist (validated in __post_init__).
 
+        Long model names are hashed so the resulting suffix never causes
+        downstream identifier truncation. The longest base table prefix used
+        by the Postgres backend is ``LIGHTRAG_VDB_RELATION`` (21 chars), and
+        the DDL embeds a ``{table_name}_PK`` constraint name (3 extra chars
+        plus an underscore separator). PostgreSQL silently truncates
+        identifiers to 63 bytes (``NAMEDATALEN-1``); without a cap the
+        implicit primary-key index can collide with the table name itself.
+        Capping the suffix at 38 chars leaves room for the longest backend
+        prefix plus the constraint suffix.
+
         Returns:
-            str | None: Suffix string e.g. "text_embedding_3_large_3072d", or None if model_name not available
+            str | None: Suffix e.g. ``"text_embedding_3_large_3072d"``, or
+            ``None`` if no model_name is available.
         """
+        import hashlib
         import re
 
         # Check if model_name exists (model_name is optional in EmbeddingFunc)
@@ -256,7 +268,21 @@ class BaseVectorStorage(StorageNameSpace, ABC):
 
         # Generate suffix: clean model name and append dimension
         safe_model_name = re.sub(r"[^a-zA-Z0-9_]", "_", model_name.lower())
-        return f"{safe_model_name}_{embedding_dim}d"
+        dim_part = f"_{embedding_dim}d"
+
+        # Cap so {longest_base_table}_{suffix}_PK fits in NAMEDATALEN-1 (63).
+        # Budget: 63 - len("LIGHTRAG_VDB_RELATION_") - len("_PK") = 63 - 22 - 3 = 38.
+        max_suffix_len = 38
+        max_model_len = max_suffix_len - len(dim_part)
+        if len(safe_model_name) > max_model_len:
+            # Keep a readable prefix plus an 8-char hash for uniqueness,
+            # mirroring the pattern used by ``_safe_index_name`` in
+            # ``kg/postgres_impl.py``.
+            digest = hashlib.md5(safe_model_name.encode("utf-8")).hexdigest()[:8]
+            keep = max_model_len - 9  # 1 underscore + 8 hex chars
+            safe_model_name = f"{safe_model_name[:keep]}_{digest}"
+
+        return f"{safe_model_name}{dim_part}"
 
     @abstractmethod
     async def query(
